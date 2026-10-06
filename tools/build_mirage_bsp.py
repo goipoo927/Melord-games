@@ -33,6 +33,15 @@ def main():
     ti_raw=lump(6); texinfo=[struct.unpack_from('<8fii',ti_raw,i) for i in range(0,len(ti_raw),40)]
     faces_raw=lump(7); faces=[struct.unpack_from('<Hhihh4si',faces_raw,i) for i in range(0,len(faces_raw),20)]
     planes_raw=lump(1); planes=[struct.unpack_from('<3ffI',planes_raw,i) for i in range(0,len(planes_raw),20)]
+    nodes_raw=lump(5); nodes=[struct.unpack_from('<i2h3h3h2H',nodes_raw,i) for i in range(0,(len(nodes_raw)//24)*24,24)]
+    leaves_raw=lump(10); leaves=[struct.unpack_from('<ii3h3h2H4B',leaves_raw,i) for i in range(0,(len(leaves_raw)//28)*28,28)]
+    def point_contents(x,y,z):
+        node=0
+        for _ in range(512):
+            if node<0: return leaves[-node-1][0] if -node-1<len(leaves) else -1
+            if node>=len(nodes): return -1
+            q=nodes[node]; pl=planes[q[0]]; side=0 if x*pl[0]+y*pl[1]+z*pl[2]>=pl[3] else 1; node=q[1+side]
+        return -1
     mt=lump(2); count=struct.unpack_from('<i',mt)[0]; miptex=[]
     for i in range(count):
         off=struct.unpack_from('<i',mt,4+i*4)[0]
@@ -57,7 +66,7 @@ def main():
     # World model only. Coordinates are converted from GoldSrc Z-up to Three.js Y-up.
     model=struct.unpack_from('<9f7i',lump(14),0); firstface,numfaces=model[-2:]
     groups={}; skipped=0; walls=[]; floor_cells={}; cell=.5; grid_min=-59.0
-    for f in faces[firstface:firstface+numfaces]:
+    for f in faces:
         _,_,firstedge,nedges,ti,_,_=f
         if ti<0 or ti>=len(texinfo) or nedges<3: skipped+=1; continue
         tv=texinfo[ti]; texid=tv[8]
@@ -78,8 +87,8 @@ def main():
             nn=(u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]); ll=math.sqrt(sum(q*q for q in nn)) or 1; nn=tuple(q/ll for q in nn); worldn=(nn[0],nn[2],-nn[1])
         else: worldn=(0,1,0)
         # Bake walkable top faces into a half-metre floor lookup and vertical faces into collision AABBs.
-        pn,pside= f[0],f[1]; normal=planes[pn][:3] if pn<len(planes) else (0,0,0)
-        if normal[2] > .72:
+        pn,pside= f[0],f[1]; normal=planes[pn][:3] if pn<len(planes) else (0,0,0); face_nz=normal[2]*(-1 if pside else 1)
+        if face_nz > .72:
             minx=min(v[0] for v in poly); maxx=max(v[0] for v in poly); miny=min(v[1] for v in poly); maxy=max(v[1] for v in poly); zz=sum(v[2] for v in poly)/len(poly)
             ix0=max(0,int(math.floor(((minx-CENTER_X)*SCALE-grid_min)/cell))); ix1=min(235,int(math.floor(((maxx-CENTER_X)*SCALE-grid_min)/cell)))
             iz0=max(0,int(math.floor((-(maxy-CENTER_Y)*SCALE-grid_min)/cell))); iz1=min(235,int(math.floor((-(miny-CENTER_Y)*SCALE-grid_min)/cell)))
@@ -114,7 +123,7 @@ def main():
         view=add_blob(blob,target); a={'bufferView':view,'componentType':component,'count':count,'type':typ}
         if mins is not None: a['min']=mins; a['max']=maxs
         accessors.append(a); return len(accessors)-1
-    images=[]; textures=[]; materials=[]; mesh_prims=[]; nodes=[]
+    images=[]; textures=[]; materials=[]; mesh_prims=[]
     for texid,g in groups.items():
         tex=miptex[texid]; name,w,h,png=tex
         imgview=add_blob(png)
@@ -131,6 +140,18 @@ def main():
         na=add_accessor(nblob,5126,len(g['n']),'VEC3',34962)
         ia=add_accessor(iblob,5125,len(idx),'SCALAR',34963)
         mesh_prims.append({'attributes':{'POSITION':pa,'TEXCOORD_0':ua,'NORMAL':na},'indices':ia,'material':len(materials)-1,'mode':4})
+    # Sample BSP solid/empty leaves above every walkable cell for accurate player and projectile collision.
+    # Bake the BSP collision tree into an absolute 3D half-metre voxel grid.
+    # Unlike face AABBs, this preserves real openings and blocks jumps through solid walls.
+    height_min=-4.0; height_step=.5; height_count=48; occupancy={}
+    for iz in range(236):
+        sy=CENTER_Y-(grid_min+(iz+.5)*cell)/SCALE
+        for ix in range(236):
+            sx=CENTER_X+(grid_min+(ix+.5)*cell)/SCALE; mask=0
+            for k in range(height_count):
+                wz=FLOOR_Z+(height_min+.25+k*height_step)/SCALE
+                if point_contents(sx,sy,wz)==-2: mask |= (1<<k)
+            if mask: occupancy[str(iz*236+ix)]=mask
     # Store exact team spawn points, snapped to the highest nearby walkable BSP face.
     ent=lump(0).decode('latin1',errors='replace')
     spawn={'CT':[],'T':[]}
@@ -153,7 +174,7 @@ def main():
     for label,mi in [('A',3),('B',4)]:
         mm=struct.unpack_from('<9f7i',lump(14),mi*64); xx=(mm[0]+mm[3])*.5; yy=(mm[1]+mm[4])*.5
         sites[label]={'x':round((xx-CENTER_X)*SCALE,4),'z':round(-(yy-CENTER_Y)*SCALE,4)}
-    extras={'source':'User-provided de_mirage_cs2.bsp (GoldSrc v30)','coordinateTransform':{'scale':SCALE,'centerX':CENTER_X,'centerY':CENTER_Y,'floorZ':FLOOR_Z},'spawns':spawn,'sites':sites,'collisionGrid':{'cell':cell,'min':grid_min,'size':236,'floors':{k:sorted(v) for k,v in floor_cells.items()},'walls':walls}}
+    extras={'source':'User-provided de_mirage_cs2.bsp (GoldSrc v30)','coordinateTransform':{'scale':SCALE,'centerX':CENTER_X,'centerY':CENTER_Y,'floorZ':FLOOR_Z},'spawns':spawn,'sites':sites,'collisionGrid':{'cell':cell,'min':grid_min,'size':236,'floors':{k:sorted(v) for k,v in floor_cells.items()},'occupancy':occupancy,'heightMin':height_min,'heightStep':height_step,'heightCount':height_count}}
     gltf={'asset':{'version':'2.0','generator':'Melord Mirage BSP converter'},'scene':0,'scenes':[{'nodes':[0]}],
           'nodes':[{'name':'de_mirage_cs2_world','mesh':0,'extras':extras}], 'meshes':[{'name':'Mirage BSP world','primitives':mesh_prims}],
           'materials':materials,'textures':textures,'images':images,'samplers':[{'magFilter':9729,'minFilter':9987,'wrapS':10497,'wrapT':10497}],
@@ -166,7 +187,7 @@ def main():
     total=12+8+len(js)+8+len(binbuf)
     OUT.write_bytes(struct.pack('<III',0x46546C67,2,total)+struct.pack('<I4s',len(js),b'JSON')+js+struct.pack('<I4s',len(binbuf),b'BIN\0')+binbuf)
     print(f'Output: {OUT} ({OUT.stat().st_size:,} bytes)')
-    print(f'World faces: {numfaces:,}; textured groups: {len(groups)}; skipped: {skipped}')
-    print(f'Spawns: CT={len(spawn["CT"])}, T={len(spawn["T"])}; floor cells={len(floor_cells)}; wall bounds={len(walls)}; sites={sites}')
+    print(f'World faces: {len(faces):,} (BSP faces total); textured groups: {len(groups)}; skipped: {skipped}')
+    print(f'Spawns: CT={len(spawn["CT"])}, T={len(spawn["T"])}; floor cells={len(floor_cells)}; solid voxel columns={len(occupancy)}; sites={sites}')
     print('CT:',spawn['CT']); print('T:',spawn['T'])
 if __name__=='__main__': main()
